@@ -12,6 +12,7 @@ const queueJob = require('./queue_job');
 
 const VERSION = 3;
 let decryptSessionMismatchWarned = false;
+let lastDecryptDiagAt = 0; // ONIMAI: Rate-Limit für Diagnose-Logging (ms)
 
 function assertBuffer(value) {
     if (!(value instanceof Buffer)) {
@@ -153,6 +154,32 @@ class SessionCipher {
                 };
             } catch(e) {
                 errs.push(e);
+            }
+        }
+        // ── ONIMAI Diagnose (additiv, hinter ENV-Flag, rate-limitiert) ──────────
+        // Klassifiziert den Fehlschlag ALLER Sessions, OHNE Verhalten zu ändern
+        // (nichts wird gelöscht/zurückgesetzt). Hilft zu unterscheiden:
+        //  • mehrere Sessions + Bad MAC → i.d.R. Session-Mismatch (harmlos; Retry-Receipt regelt)
+        //  • genau 1 Session + Bad MAC  → möglicher echter Korruptionsfall
+        //  • MessageCounterError        → bereits entschlüsselt (benigne Doppelverarbeitung)
+        // Aktivieren via ONIMAI_LOG_SIGNAL_DECRYPT_WARN=1.
+        if (process.env.ONIMAI_LOG_SIGNAL_DECRYPT_WARN === '1') {
+            const __now = Date.now();
+            if (__now - lastDecryptDiagAt > 2000) {
+                lastDecryptDiagAt = __now;
+                let badMac = 0, counter = 0, other = 0;
+                for (const e of errs) {
+                    const em = String((e && e.message) || e || '');
+                    if (/Bad MAC|verifyMAC|\bMAC\b/i.test(em)) badMac++;
+                    else if (/Key used already|never filled|MessageCounter/i.test(em)) counter++;
+                    else other++;
+                }
+                let kind = 'session_mismatch';
+                if (counter > 0 && badMac === 0 && other === 0) kind = 'already_decrypted';
+                else if (sessions.length === 1 && badMac > 0) kind = 'possible_corruption';
+                try {
+                    console.warn(`[ONIMAI signal-diag] decrypt failed addr=${this.addr.toString()} sessions=${sessions.length} badMac=${badMac} counter=${counter} other=${other} -> ${kind}`);
+                } catch (_) {}
             }
         }
         if (!decryptSessionMismatchWarned) {
